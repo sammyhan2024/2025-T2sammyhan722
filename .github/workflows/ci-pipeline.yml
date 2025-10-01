@@ -96,3 +96,28 @@ jobs:
         run: |
           docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }} backend/product_service
           docker push ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
+
+  deploy_staging:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy customer service to staging
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: customer-service-staging
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_CUSTOMER_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/customer-service:${{ github.sha }}
+
+      - name: Deploy order service to staging
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: order-service-staging
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_ORDER_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/order-service:${{ github.sha }}
+
+      - name: Deploy product service to staging
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: product-service-staging
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_PRODUCT_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
