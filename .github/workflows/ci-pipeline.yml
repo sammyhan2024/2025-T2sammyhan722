@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - testing
+      - main
 
 jobs:
   test:
@@ -100,6 +101,7 @@ jobs:
   deploy_staging:
     needs: build_and_push
     runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/testing'
     steps:
       - name: Deploy customer service to staging
         uses: azure/webapps-deploy@v2
@@ -120,4 +122,33 @@ jobs:
         with:
           app-name: product-service-staging
           publish-profile: ${{ secrets.PUBLISH_PROFILE_PRODUCT_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
+
+  deploy_production:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://customer-service-production.azurewebsites.net
+    steps:
+      - name: Deploy customer service to production
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: customer-service-production
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_CUSTOMER_PRODUCTION }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/customer-service:${{ github.sha }}
+
+      - name: Deploy order service to production
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: order-service-production
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_ORDER_PRODUCTION }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/order-service:${{ github.sha }}
+
+      - name: Deploy product service to production
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: product-service-production
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_PRODUCT_PRODUCTION }}
           images: ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
