@@ -102,7 +102,7 @@ jobs:
   deploy_staging:
     needs: build_and_push
     runs-on: ubuntu-latest
-  if: github.ref == 'refs/heads/testing' && vars.DEPLOY_STAGING == 'true'
+    if: github.ref == 'refs/heads/testing' && vars.DEPLOY_STAGING == 'true'
     steps:
       - name: Deploy customer service to staging
         uses: azure/webapps-deploy@v2
