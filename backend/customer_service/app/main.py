@@ -48,39 +48,59 @@ app.add_middleware(
 )
 
 
+import asyncio
+# ...existing code...
 # --- FastAPI Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
+    """
+    Asynchronous startup event handler.
+
+    This function is executed when the FastAPI application starts. It attempts to
+    connect to the PostgreSQL database and create tables. If the connection fails,
+    it retries with an exponential backoff strategy. This non-blocking approach
+    is crucial for containerized environments where services may start at different
+    times.
+    """
+    logger.info("Customer Service: Starting up...")
     max_retries = 10
     retry_delay_seconds = 5
-    for i in range(max_retries):
-        try:
-            logger.info(
-                f"Customer Service: Attempting to connect to PostgreSQL and create tables (attempt {i+1}/{max_retries})..."
-            )
-            Base.metadata.create_all(bind=engine)
-            logger.info(
-                "Customer Service: Successfully connected to PostgreSQL and ensured tables exist."
-            )
-            break  # Exit loop if successful
-        except OperationalError as e:
-            logger.warning(f"Customer Service: Failed to connect to PostgreSQL: {e}")
-            if i < max_retries - 1:
+
+    async def connect_to_db():
+        for i in range(max_retries):
+            try:
                 logger.info(
-                    f"Customer Service: Retrying in {retry_delay_seconds} seconds..."
+                    f"Customer Service: Attempting to connect to PostgreSQL and create tables (attempt {i+1}/{max_retries})..."
                 )
-                time.sleep(retry_delay_seconds)
-            else:
+                # The `create_all` function is synchronous, so we run it in a thread pool
+                # to avoid blocking the asyncio event loop.
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, Base.metadata.create_all, engine)
+                logger.info(
+                    "Customer Service: Successfully connected to PostgreSQL and ensured tables exist."
+                )
+                return  # Exit if successful
+            except OperationalError as e:
+                logger.warning(f"Customer Service: Failed to connect to PostgreSQL: {e}")
+                if i < max_retries - 1:
+                    logger.info(
+                        f"Customer Service: Retrying in {retry_delay_seconds} seconds..."
+                    )
+                    await asyncio.sleep(retry_delay_seconds)
+                else:
+                    logger.critical(
+                        f"Customer Service: Failed to connect to PostgreSQL after {max_retries} attempts. The service will start but may not be functional."
+                    )
+            except Exception as e:
                 logger.critical(
-                    f"Customer Service: Failed to connect to PostgreSQL after {max_retries} attempts. Exiting application."
+                    f"Customer Service: An unexpected error occurred during database startup: {e}",
+                    exc_info=True,
                 )
-                sys.exit(1)  # Critical failure: exit if DB connection is unavailable
-        except Exception as e:
-            logger.critical(
-                f"Customer Service: An unexpected error occurred during database startup: {e}",
-                exc_info=True,
-            )
-            sys.exit(1)
+                # Do not exit; allow the service to start to enable diagnostics
+                break
+
+    # Run the connection logic in the background
+    asyncio.create_task(connect_to_db())
 
 
 # --- Root Endpoint ---

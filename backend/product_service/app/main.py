@@ -3,14 +3,12 @@ import json
 import logging
 import os
 import sys
-import time
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import List, Optional
-from urllib.parse import urlparse
 
 import aio_pika
-
+from azure.core.exceptions import AzureError
 from azure.storage.blob import (
     BlobSasPermissions,
     BlobServiceClient,
@@ -29,7 +27,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.exc import OperationalError, IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError
 from sqlalchemy.orm import Session
 
 from .db import Base, engine, get_db
@@ -44,551 +42,278 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Suppress noisy logs from third-party libraries for cleaner output
 logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
+# --- Environment and Global Variables ---
 AZURE_STORAGE_ACCOUNT_NAME = os.getenv("AZURE_STORAGE_ACCOUNT_NAME")
 AZURE_STORAGE_ACCOUNT_KEY = os.getenv("AZURE_STORAGE_ACCOUNT_KEY")
-AZURE_STORAGE_CONTAINER_NAME = os.getenv(
-    "AZURE_STORAGE_CONTAINER_NAME", "product-images"
-)
+AZURE_STORAGE_CONTAINER_NAME = os.getenv("AZURE_STORAGE_CONTAINER_NAME", "product-images")
 AZURE_SAS_TOKEN_EXPIRY_HOURS = int(os.getenv("AZURE_SAS_TOKEN_EXPIRY_HOURS", "24"))
 
-blob_service_client: Optional[BlobServiceClient] = None
-
-# Initialize BlobServiceClient
-if AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY:
-    try:
-        blob_service_client = BlobServiceClient(
-            account_url=f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net",
-            credential=AZURE_STORAGE_ACCOUNT_KEY,
-        )
-        logger.info("Product Service: Azure BlobServiceClient initialized.")
-        # Ensure the container exists
-        try:
-            container_client = blob_service_client.get_container_client(
-                AZURE_STORAGE_CONTAINER_NAME
-            )
-            container_client.create_container()
-            logger.info(
-                f"Product Service: Azure container '{AZURE_STORAGE_CONTAINER_NAME}' ensured to exist."
-            )
-        except Exception as e:
-            logger.warning(
-                f"Product Service: Could not create or verify Azure container '{AZURE_STORAGE_CONTAINER_NAME}'. It might already exist. Error: {e}"
-            )
-    except Exception as e:
-        logger.critical(
-            f"Product Service: Failed to initialize Azure BlobServiceClient. Check credentials and account name. Error: {e}",
-            exc_info=True,
-        )
-        blob_service_client = None  # Set to None if initialization fails
-else:
-    logger.warning(
-        "Product Service: Azure Storage credentials not found. Image upload functionality will be disabled."
-    )
-    blob_service_client = None
-
-
-RESTOCK_THRESHOLD = 5
-
-# --- RabbitMQ Configuration ---
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")
 RABBITMQ_PORT = int(os.getenv("RABBITMQ_PORT", "5672"))
 RABBITMQ_USER = os.getenv("RABBITMQ_USER", "guest")
 RABBITMQ_PASS = os.getenv("RABBITMQ_PASS", "guest")
 
-# Global RabbitMQ connection and channel objects
+RESTOCK_THRESHOLD = 5
+
+# --- Global Clients and Connections ---
+blob_service_client: Optional[BlobServiceClient] = None
 rabbitmq_connection: Optional[aio_pika.Connection] = None
-rabbitmq_channel: Optional[aio_pika.Channel] = None
-rabbitmq_exchange: Optional[aio_pika.Exchange] = None
+stock_update_channel: Optional[aio_pika.Channel] = None
 
 # --- FastAPI Application Setup ---
 app = FastAPI(
     title="Product Service API",
-    description="Manages products and stock for mini-ecommerce app, with Azure Storage integration.",
+    description="Manages products and stock for a mini-ecommerce app, with Azure Storage integration.",
     version="1.0.0",
 )
 
-# Enable CORS (for frontend dev/testing)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Use specific origins in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# --- Service Initialization and Lifecycle Events ---
 
-# --- RabbitMQ Helper Functions ---
-async def connect_to_rabbitmq():
-    """Establishes an asynchronous connection to RabbitMQ."""
-    global rabbitmq_connection, rabbitmq_channel, rabbitmq_exchange
-
-    rabbitmq_url = (
-        f"amqp://{RABBITMQ_USER}:{RABBITMQ_PASS}@{RABBITMQ_HOST}:{RABBITMQ_PORT}/"
-    )
-    max_retries = 10
-    retry_delay_seconds = 5
-
-    for i in range(max_retries):
+def initialize_blob_storage():
+    """Initializes the Azure Blob Storage client and handles potential errors."""
+    global blob_service_client
+    if AZURE_STORAGE_ACCOUNT_NAME and AZURE_STORAGE_ACCOUNT_KEY:
         try:
-            logger.info(
-                f"Product Service: Attempting to connect to RabbitMQ (attempt {i+1}/{max_retries})..."
-            )
-            rabbitmq_connection = await aio_pika.connect_robust(rabbitmq_url)
-            rabbitmq_channel = await rabbitmq_connection.channel()
-            # Declare a direct exchange for events
-            rabbitmq_exchange = await rabbitmq_channel.declare_exchange(
-                "ecomm_events", aio_pika.ExchangeType.DIRECT, durable=True
-            )
-            logger.info(
-                "Product Service: Connected to RabbitMQ and declared 'ecomm_events' exchange."
-            )
-            return True
+            # Basic validation to prevent the common "Incorrect padding" error
+            if len(AZURE_STORAGE_ACCOUNT_KEY) % 4 != 0:
+                raise ValueError("The Azure Storage Account Key has an invalid length or format.")
+            
+            account_url = f"https://{AZURE_STORAGE_ACCOUNT_NAME}.blob.core.windows.net"
+            blob_service_client = BlobServiceClient(account_url=account_url, credential=AZURE_STORAGE_ACCOUNT_KEY)
+            
+            logger.info("Product Service: Azure BlobServiceClient initialized.")
+            
+            # Ensure the container exists
+            container_client = blob_service_client.get_container_client(AZURE_STORAGE_CONTAINER_NAME)
+            container_client.create_container()
+            logger.info(f"Product Service: Azure container '{AZURE_STORAGE_CONTAINER_NAME}' is ready.")
+            
+        except (ValueError, AzureError) as e:
+            logger.critical(f"Product Service: Failed to initialize Azure BlobServiceClient. Error: {e}", exc_info=True)
+            blob_service_client = None
         except Exception as e:
-            logger.warning(f"Product Service: Failed to connect to RabbitMQ: {e}")
-            if i < max_retries - 1:
-                await asyncio.sleep(retry_delay_seconds)
-            else:
-                logger.critical(
-                    f"Product Service: Failed to connect to RabbitMQ after {max_retries} attempts. RabbitMQ functionality will be limited."
-                )
-                return False
-    return False
+            logger.critical(f"Product Service: An unexpected error occurred during Azure BlobServiceClient initialization. Error: {e}", exc_info=True)
+            blob_service_client = None
+    else:
+        logger.warning("Product Service: Azure Storage credentials not found. Image upload functionality will be disabled.")
+        blob_service_client = None
 
+async def connect_to_rabbitmq(max_retries=5, initial_delay=5, max_delay=30):
+    """Establishes a connection to RabbitMQ with exponential backoff, returning None on failure."""
+    retries = 0
+    delay = initial_delay
+    while retries < max_retries:
+        try:
+            connection = await aio_pika.connect_robust(
+                host=RABBITMQ_HOST, port=RABBITMQ_PORT, login=RABBITMQ_USER, password=RABBITMQ_PASS, timeout=10
+            )
+            logger.info("Product Service: Successfully connected to RabbitMQ.")
+            return connection
+        except Exception as e:
+            retries += 1
+            logger.warning(f"Product Service: RabbitMQ connection failed (attempt {retries}/{max_retries}). Error: {e}. Retrying in {delay} seconds...")
+            if retries >= max_retries:
+                break
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, max_delay)
+    
+    logger.error("Product Service: Could not connect to RabbitMQ after multiple retries. Messaging features will be disabled.")
+    return None
 
-async def close_rabbitmq_connection():
-    """Closes the RabbitMQ connection."""
-    if rabbitmq_connection:
-        logger.info("Product Service: Closing RabbitMQ connection.")
-        await rabbitmq_connection.close()
-
-
-async def publish_event(routing_key: str, message_data: dict):
-    """Publishes a message to the RabbitMQ exchange."""
-    if not rabbitmq_exchange:
-        logger.error(
-            f"Product Service: RabbitMQ exchange not available. Cannot publish event '{routing_key}'."
-        )
-        return
-    try:
-        message_body = json.dumps(message_data).encode("utf-8")
-        message = aio_pika.Message(
-            body=message_body,
-            content_type="application/json",
-            delivery_mode=aio_pika.DeliveryMode.PERSISTENT,  # Make message persistent
-        )
-        await rabbitmq_exchange.publish(message, routing_key=routing_key)
-        logger.info(
-            f"Product Service: Published event '{routing_key}' with data: {message_data}"
-        )
-    except Exception as e:
-        logger.error(
-            f"Product Service: Failed to publish event '{routing_key}': {e}",
-            exc_info=True,
-        )
-
-
-async def consume_order_placed_events(db_session: Session):
-    """
-    Consumes messages from the 'order.placed' queue and processes stock deductions.
-    This function runs in a separate background task.
-    """
-    if not rabbitmq_channel or not rabbitmq_exchange:
-        logger.error(
-            "Product Service: RabbitMQ channel or exchange not available for consuming order events."
-        )
-        return
-
-    queue_name = "product_service_order_placed_queue"
-    order_placed_routing_key = "order.placed"
-
-    try:
-        queue = await rabbitmq_channel.declare_queue(queue_name, durable=True)
-        await queue.bind(rabbitmq_exchange, routing_key=order_placed_routing_key)
-        logger.info(
-            f"Product Service: Listening for '{order_placed_routing_key}' messages on queue '{queue_name}'."
-        )
-
-        async with queue.iterator() as queue_iter:
-            async for message in queue_iter:
-                async with message.process():
-                    try:
-                        message_data = json.loads(message.body.decode("utf-8"))
-                        logger.info(
-                            f"Product Service: Received order.placed message: {message_data}"
-                        )
-
-                        order_id = message_data.get("order_id")
-                        order_items = message_data.get("items", [])
-
-                        success = True
-                        failed_products = []
-
-                        local_db_session = Session(bind=engine)
-                        try:
-                            for item in order_items:
-                                product_id = item.get("product_id")
-                                quantity = item.get("quantity")
-                                if not product_id or not quantity:
-                                    logger.error(
-                                        f"Product Service: Invalid item data in message: {item}"
-                                    )
-                                    success = False
-                                    break
-
-                                # Deduct stock
-                                db_product = (
-                                    local_db_session.query(Product)
-                                    .filter(Product.product_id == product_id)
-                                    .first()
-                                )
-
-                                if not db_product:
-                                    logger.warning(
-                                        f"Product Service: Stock deduction failed for order {order_id}. Product {product_id} not found."
-                                    )
-                                    success = False
-                                    failed_products.append(
-                                        {
-                                            "product_id": product_id,
-                                            "reason": "product_not_found",
-                                        }
-                                    )
-                                    break  # Fail entire order deduction if a product is not found
-
-                                if db_product.stock_quantity < quantity:
-                                    logger.warning(
-                                        f"Product Service: Stock deduction failed for order {order_id}. Insufficient stock for product {product_id}. Available: {db_product.stock_quantity}, Requested: {quantity}."
-                                    )
-                                    success = False
-                                    failed_products.append(
-                                        {
-                                            "product_id": product_id,
-                                            "reason": "insufficient_stock",
-                                            "available_stock": db_product.stock_quantity,
-                                        }
-                                    )
-                                    break  # Fail entire order deduction if stock is insufficient
-
-                                db_product.stock_quantity -= quantity
-                                local_db_session.add(db_product)
-                                logger.info(
-                                    f"Product Service: Deducted {quantity} from product {product_id} for order {order_id}. New stock: {db_product.stock_quantity}."
-                                )
-
-                                # Optional: Log or trigger alert if stock falls below threshold
-                                if db_product.stock_quantity < RESTOCK_THRESHOLD:
-                                    logger.warning(
-                                        f"Product Service: ALERT! Stock for product '{db_product.name}' (ID: {db_product.product_id}) is low: {db_product.stock_quantity}."
-                                    )
-
-                            if success:
-                                local_db_session.commit()
-                                logger.info(
-                                    f"Product Service: Successfully deducted stock for all items in order {order_id}. Publishing 'product.stock.deducted' event."
-                                )
-                                await publish_event(
-                                    "product.stock.deducted",
-                                    {
-                                        "order_id": order_id,
-                                        "status": "success",
-                                        "timestamp": datetime.utcnow().isoformat(),
-                                    },
-                                )
-                            else:
-                                local_db_session.rollback()  # Rollback all changes if any item fails
-                                logger.error(
-                                    f"Product Service: Failed to deduct stock for order {order_id}. Rolling back. Publishing 'product.stock.deduction.failed' event."
-                                )
-                                await publish_event(
-                                    "product.stock.deduction.failed",
-                                    {
-                                        "order_id": order_id,
-                                        "status": "failed",
-                                        "timestamp": datetime.utcnow().isoformat(),
-                                        "details": failed_products,
-                                    },
-                                )
-                        except Exception as db_e:
-                            local_db_session.rollback()
-                            logger.critical(
-                                f"Product Service: Database error during stock deduction for order {order_id}: {db_e}",
-                                exc_info=True,
-                            )
-                            await publish_event(
-                                "product.stock.deduction.failed",
-                                {
-                                    "order_id": order_id,
-                                    "status": "failed",
-                                    "timestamp": datetime.utcnow().isoformat(),
-                                    "details": [
-                                        {
-                                            "reason": "database_error",
-                                            "message": str(db_e),
-                                        }
-                                    ],
-                                },
-                            )
-                        finally:
-                            local_db_session.close()
-
-                    except json.JSONDecodeError as e:
-                        logger.error(
-                            f"Product Service: Failed to decode RabbitMQ message body: {e}. Message: {message.body}"
-                        )
-                    except Exception as e:
-                        logger.error(
-                            f"Product Service: Unhandled error processing order.placed message: {e}",
-                            exc_info=True,
-                        )
-    except Exception as e:
-        logger.critical(
-            f"Product Service: Error in RabbitMQ consumer for order.placed events: {e}",
-            exc_info=True,
-        )
-
-
-# --- FastAPI Event Handlers ---
 @app.on_event("startup")
 async def startup_event():
-    max_retries = 10
-    retry_delay_seconds = 5
-    for i in range(max_retries):
+    """Handles application startup logic: DB, Blob Storage, and RabbitMQ connections."""
+    global rabbitmq_connection, stock_update_channel
+    logger.info("Product Service: Application startup sequence initiated.")
+
+    # 1. Initialize Azure Blob Storage
+    initialize_blob_storage()
+
+    # 2. Establish database connection
+    try:
+        Base.metadata.create_all(bind=engine)
+        logger.info("Product Service: Database tables verified/created.")
+    except OperationalError as e:
+        logger.critical(f"Product Service: Database connection failed: {e}", exc_info=True)
+        sys.exit(f"Critical Error: Could not connect to the database. Shutting down. {e}")
+
+    # 3. Establish RabbitMQ connection (optional)
+    rabbitmq_connection = await connect_to_rabbitmq()
+    if rabbitmq_connection:
         try:
-            logger.info(
-                f"Product Service: Attempting to connect to PostgreSQL and create tables (attempt {i+1}/{max_retries})..."
-            )
-            Base.metadata.create_all(bind=engine)
-            logger.info(
-                "Product Service: Successfully connected to PostgreSQL and ensured tables exist."
-            )
-            break  # Exit loop if successful
-        except OperationalError as e:
-            logger.warning(f"Product Service: Failed to connect to PostgreSQL: {e}")
-            if i < max_retries - 1:
-                logger.info(
-                    f"Product Service: Retrying in {retry_delay_seconds} seconds..."
-                )
-                time.sleep(retry_delay_seconds)
-            else:
-                logger.critical(
-                    f"Product Service: Failed to connect to PostgreSQL after {max_retries} attempts. Exiting application."
-                )
-                sys.exit(1)  # Critical failure: exit if DB connection is unavailable
+            stock_update_channel = await rabbitmq_connection.channel()
+            await stock_update_channel.exchange_declare("product_events", aio_pika.ExchangeType.TOPIC, durable=True)
+            logger.info("Product Service: RabbitMQ channel and exchange are ready.")
         except Exception as e:
-            logger.critical(
-                f"Product Service: An unexpected error occurred during database startup: {e}",
-                exc_info=True,
-            )
-            sys.exit(1)
+            logger.error(f"Product Service: Failed to set up RabbitMQ channel/exchange. Error: {e}", exc_info=True)
+            stock_update_channel = None
+    
+    logger.info("Product Service: Application startup sequence completed.")
 
-    # Connect to RabbitMQ and start consumer
-    if await connect_to_rabbitmq():
-        asyncio.create_task(consume_order_placed_events(next(get_db())))
-    else:
-        logger.error(
-            "Product Service: RabbitMQ connection failed at startup. Async order processing will not work."
-        )
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Handles application shutdown, gracefully closing connections."""
+    logger.info("Product Service: Application shutdown sequence initiated.")
+    if rabbitmq_connection and not rabbitmq_connection.is_closed:
+        await rabbitmq_connection.close()
+        logger.info("Product Service: RabbitMQ connection closed.")
 
+# --- Messaging Helper Functions ---
 
-# --- Root Endpoint ---
+async def publish_stock_update(product: Product):
+    """Publishes a stock update message to RabbitMQ if the connection is available."""
+    if not stock_update_channel:
+        logger.warning(f"Skipping stock update for Product ID {product.id}: RabbitMQ is not connected.")
+        return
+
+    message_body = json.dumps({
+        "product_id": product.id,
+        "new_stock": product.stock,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+    message = aio_pika.Message(
+        body=message_body.encode(),
+        delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
+        content_type="application/json",
+    )
+    try:
+        exchange = await stock_update_channel.get_exchange("product_events")
+        await exchange.publish(message, routing_key="stock.updated")
+        logger.info(f"Published stock update for Product ID {product.id}")
+    except Exception as e:
+        logger.error(f"Failed to publish stock update for Product ID {product.id}. Error: {e}", exc_info=True)
+
+# --- API Endpoints ---
+
 @app.get("/", status_code=status.HTTP_200_OK, summary="Root endpoint")
 async def read_root():
     return {"message": "Welcome to the Product Service!"}
 
-
-# --- Health Check Endpoint ---
 @app.get("/health", status_code=status.HTTP_200_OK, summary="Health check endpoint")
 async def health_check():
     return {"status": "ok", "service": "product-service"}
 
-
-# --- CRUD Endpoints ---
-@app.post(
-    "/products/",
-    response_model=ProductResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Create a new product",
-)
+@app.post("/products/", response_model=ProductResponse, status_code=status.HTTP_201_CREATED)
 async def create_product(product: ProductCreate, db: Session = Depends(get_db)):
-    logger.info(f"Product Service: Creating product: {product.name}")
+    """Creates a new product and publishes a stock update event."""
     try:
         db_product = Product(**product.model_dump())
         db.add(db_product)
         db.commit()
         db.refresh(db_product)
-        logger.info(
-            f"Product Service: Product '{db_product.name}' (ID: {db_product.product_id}) created successfully."
-        )
+        await publish_stock_update(db_product)
         return db_product
     except IntegrityError:
         db.rollback()
-        logger.warning(
-            f"Product Service: Integrity error creating product: likely duplicate name or ID issue for product: {product.name}"
-        )
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail="Product with this name might already exist or similar data integrity issue.",
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Product with this name or SKU already exists.")
     except Exception as e:
         db.rollback()
-        logger.error(f"Product Service: Error creating product: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not create product.",
-        )
+        logger.error(f"Error creating product: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Could not create product.")
 
+@app.get("/products/", response_model=List[ProductResponse])
+def list_products(db: Session = Depends(get_db), skip: int = 0, limit: int = 100):
+    """Retrieves a list of products."""
+    return db.query(Product).offset(skip).limit(limit).all()
 
-@app.get(
-    "/products/",
-    response_model=List[ProductResponse],
-    summary="Retrieve a list of all products",
-)
-def list_products(
-    db: Session = Depends(get_db),
-    skip: int = Query(0, ge=0),
-    limit: int = Query(100, ge=1, le=100),
-    search: Optional[str] = Query(None, max_length=255),
-):
-    logger.info(
-        f"Product Service: Listing products with skip={skip}, limit={limit}, search='{search}'"
-    )
-    query = db.query(Product)
-    if search:
-        search_pattern = f"%{search}%"
-        logger.info(f"Product Service: Applying search filter for term: {search}")
-        query = query.filter(
-            (Product.name.ilike(search_pattern))
-            | (Product.description.ilike(search_pattern))
-        )
-    products = query.offset(skip).limit(limit).all()
-
-    logger.info(
-        f"Product Service: Retrieved {len(products)} products (skip={skip}, limit={limit})."
-    )
-    return products
-
-
-@app.get(
-    "/products/{product_id}",
-    response_model=ProductResponse,
-    summary="Retrieve a single product by ID",
-)
+@app.get("/products/{product_id}", response_model=ProductResponse)
 def get_product(product_id: int, db: Session = Depends(get_db)):
-    logger.info(f"Product Service: Fetching product with ID: {product_id}")
-    product = db.query(Product).filter(Product.product_id == product_id).first()
+    """Retrieves a single product by its ID."""
+    product = db.query(Product).filter(Product.id == product_id).first()
     if not product:
-        logger.warning(f"Product Service: Product with ID {product_id} not found.")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
-        )
-
-    logger.info(
-        f"Product Service: Retrieved product with ID {product_id}. Name: {product.name}"
-    )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
     return product
 
-
-@app.put(
-    "/products/{product_id}",
-    response_model=ProductResponse,
-    summary="Update an existing product by ID",
-)
-async def update_product(
-    product_id: int, product: ProductUpdate, db: Session = Depends(get_db)
-):
-    logger.info(
-        f"Product Service: Updating product with ID: {product_id} with data: {product.model_dump(exclude_unset=True)}"
-    )
-    db_product = db.query(Product).filter(Product.product_id == product_id).first()
+@app.put("/products/{product_id}", response_model=ProductResponse)
+async def update_product_details(product_id: int, product_update: ProductUpdate, db: Session = Depends(get_db)):
+    """Updates a product's details and publishes a stock update event."""
+    db_product = db.query(Product).filter(Product.id == product_id).first()
     if not db_product:
-        logger.warning(
-            f"Product Service: Attempted to update non-existent product with ID {product_id}."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
-        )
-
-    update_data = product.model_dump(exclude_unset=True)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    
+    update_data = product_update.model_dump(exclude_unset=True)
     for key, value in update_data.items():
         setattr(db_product, key, value)
+    
+    db.commit()
+    db.refresh(db_product)
+    await publish_stock_update(db_product)
+    return db_product
 
-    try:
-        db.add(db_product)  # Mark for update
-        db.commit()
-        db.refresh(db_product)
-        logger.info(f"Product Service: Product {product_id} updated successfully.")
-        return db_product
-    except Exception as e:
-        db.rollback()
-        logger.error(
-            f"Product Service: Error updating product {product_id}: {e}", exc_info=True
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Could not update product.",
-        )
-
-
-@app.delete(
-    "/products/{product_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
-    summary="Delete a product by ID",
-)
+@app.delete("/products/{product_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_product(product_id: int, db: Session = Depends(get_db)):
-    logger.info(f"Product Service: Attempting to delete product with ID: {product_id}")
-    product = db.query(Product).filter(Product.product_id == product_id).first()
-    if not product:
-        logger.warning(
-            f"Product Service: Attempted to delete non-existent product with ID {product_id}."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
-        )
-
-    try:
-        db.delete(product)
-        db.commit()
-        logger.info(
-            f"Product Service: Product {product_id} deleted successfully. Name: {product.name}"
-        )
-    except Exception as e:
-        db.rollback()
-        logger.error(
-            f"Product Service: Error deleting product {product_id}: {e}", exc_info=True
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="An error occurred while deleting the product.",
-        )
+    """Deletes a product."""
+    db_product = db.query(Product).filter(Product.id == product_id).first()
+    if not db_product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    
+    db.delete(db_product)
+    db.commit()
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
-
-@app.post(
-    "/products/{product_id}/upload-image",
-    response_model=ProductResponse,
-    summary="Upload an image for a product to Azure Blob Storage",
-)
-async def upload_product_image(
-    product_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)
-):
-    if not blob_service_client:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Azure Blob Storage is not configured or available.",
-        )
-
-    db_product = db.query(Product).filter(Product.product_id == product_id).first()
+@app.post("/products/deduct-stock", status_code=status.HTTP_200_OK)
+async def deduct_stock(request: StockDeductRequest, db: Session = Depends(get_db)):
+    """Deducts stock for a given product ID."""
+    db_product = db.query(Product).filter(Product.id == request.product_id).first()
     if not db_product:
-        logger.warning(
-            f"Product Service: Product with ID {product_id} not found for image upload."
-        )
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Product not found"
-        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    
+    if db_product.stock < request.quantity:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Insufficient stock")
+        
+    db_product.stock -= request.quantity
+    db.commit()
+    db.refresh(db_product)
+    await publish_stock_update(db_product)
+    return {"message": f"Stock for product {request.product_id} deducted successfully."}
+
+@app.post("/products/{product_id}/upload-image", response_model=ProductResponse)
+async def upload_product_image(product_id: int, file: UploadFile = File(...), db: Session = Depends(get_db)):
+    """Handles image uploads for a specific product to Azure Blob Storage."""
+    if not blob_service_client:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Image upload service is not configured or available.")
+
+    db_product = db.query(Product).filter(Product.id == product_id).first()
+    if not db_product:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+
+    try:
+        # Sanitize filename and create a unique blob name
+        file_extension = os.path.splitext(file.filename)[1]
+        blob_name = f"product_{product_id}_{int(datetime.utcnow().timestamp())}{file_extension}"
+        
+        blob_client = blob_service_client.get_blob_client(container=AZURE_STORAGE_CONTAINER_NAME, blob=blob_name)
+        
+        # Set content type for proper browser rendering
+        content_settings = ContentSettings(content_type=file.content_type)
+        
+        # Upload the file
+        contents = await file.read()
+        blob_client.upload_blob(contents, content_settings=content_settings)
+        
+        # Update the product's image URL
+        db_product.image_url = blob_client.url
+        db.commit()
+        db.refresh(db_product)
+        
+        return db_product
+    except AzureError as e:
+        logger.error(f"Azure Storage error during image upload for product {product_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Failed to upload image to cloud storage.")
+    except Exception as e:
+        logger.error(f"An unexpected error occurred during image upload for product {product_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="An unexpected error occurred during image upload.")
 
     # Basic file type validation
     allowed_content_types = ["image/jpeg", "image/png", "image/gif"]

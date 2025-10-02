@@ -1,0 +1,5 @@
+<step title="Incoming Request" date="2025-10-02T07:54:35.651" instance="111b2a" url="/diagnostics/runtime" method="GET" type="request" pid="772,1,5" Host="product-service-production.scm.azurewebsites.net" User-Agent="GITHUBACTIONS_DeployWebAppToAzure_6c0f9c2151e6bdb78dd091d21d76674f36ebc850c2e95fc9272f6040e62bd16e" Authorization="Bas..." Content-Type="application/json; charset=utf-8" Content-Length="0" X-ARR-LOG-ID="74dc4018-3803-497d-a099-ea013973e74f" CLIENT-IP="128.24.161.196:25600" X-SITE-DEPLOYMENT-ID="product-service-production" WAS-DEFAULT-HOSTNAME="product-service-production.scm.azurewebsites.net" X-Forwarded-Proto="https" X-AppService-Proto="https" X-Forwarded-TlsVersion="1.3" X-WAWS-Unencoded-URL="/diagnostics/runtime" X-Client-IP="128.24.161.196" X-Client-Port="25600" >
+  <step title="Cleanup Xml Logs" date="2025-10-02T07:54:35.722" /><!-- duration: 80ms -->
+  <step title="RuntimeController.GetRuntimeVersions" date="2025-10-02T07:54:37.680" /><!-- duration: 79ms -->
+  <step title="Outgoing response" date="2025-10-02T07:54:38.170" type="response" statusCode="200" statusText="OK" /><!-- duration: 100ms -->
+</step><!-- duration: 2696ms -->
