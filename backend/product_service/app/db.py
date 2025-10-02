@@ -1,5 +1,5 @@
 import os
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse, quote_plus
 
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
@@ -20,17 +20,29 @@ POSTGRES_SSLMODE = os.getenv("POSTGRES_SSLMODE")
 def _ensure_ssl(database_url: str) -> str:
     parsed = urlparse(database_url)
     hostname = parsed.hostname
-    if not hostname or hostname in LOCALHOST_VALUES:
-        return database_url
 
     query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
-    for key, _ in query_pairs:
-        if key.lower() == "sslmode":
-            return database_url
+    has_ssl = any(key.lower() == "sslmode" for key, _ in query_pairs)
+    if not has_ssl and hostname and hostname not in LOCALHOST_VALUES:
+        query_pairs.append(("sslmode", "require"))
 
-    query_pairs.append(("sslmode", "require"))
     new_query = urlencode(query_pairs)
-    return urlunparse(parsed._replace(query=new_query))
+
+    username = parsed.username
+    password = parsed.password
+    auth = ""
+    if username:
+        auth = quote_plus(username)
+        if password is not None:
+            auth += f":{quote_plus(password)}"
+        auth += "@"
+
+    host_component = parsed.hostname or ""
+    if parsed.port:
+        host_component = f"{host_component}:{parsed.port}"
+    netloc = f"{auth}{host_component}" if host_component else parsed.netloc
+
+    return urlunparse(parsed._replace(netloc=netloc, query=new_query))
 
 
 def _build_database_url() -> str:
@@ -45,9 +57,12 @@ def _build_database_url() -> str:
     query = urlencode({"sslmode": sslmode}) if sslmode else ""
     query_fragment = f"?{query}" if query else ""
 
+    user = quote_plus(POSTGRES_USER)
+    password = quote_plus(POSTGRES_PASSWORD)
+
     constructed_url = (
         "postgresql://"
-        f"{POSTGRES_USER}:{POSTGRES_PASSWORD}@"
+        f"{user}:{password}@"
         f"{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}{query_fragment}"
     )
     return _ensure_ssl(constructed_url)
