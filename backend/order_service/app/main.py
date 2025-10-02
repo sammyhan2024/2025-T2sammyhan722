@@ -42,6 +42,11 @@ logger.info(
     f"Order Service: Configured to communicate with Customer Service at: {CUSTOMER_SERVICE_URL}"
 )
 
+PRODUCT_SERVICE_URL = os.getenv("PRODUCT_SERVICE_URL", "http://localhost:8001")
+logger.info(
+    f"Order Service: Configured to communicate with Product Service at: {PRODUCT_SERVICE_URL}"
+)
+
 
 # --- RabbitMQ Configuration ---
 RABBITMQ_HOST = os.getenv("RABBITMQ_HOST", "localhost")

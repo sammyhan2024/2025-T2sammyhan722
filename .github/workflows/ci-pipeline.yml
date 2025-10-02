@@ -1,0 +1,155 @@
+name: CI Pipeline
+
+on:
+  push:
+    branches:
+      - testing
+      - main
+
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customers
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install and Test Customer Service
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customers
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/customers"
+        run: |
+          pip install -r backend/customer_service/requirements-dev.txt
+          pytest backend/customer_service/tests/
+
+      - name: Install and Test Order Service
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customers
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/customers"
+        run: |
+          pip install -r backend/order_service/requirements-dev.txt
+          pytest backend/order_service/tests/
+
+      - name: Install and Test Product Service
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: customers
+          POSTGRES_HOST: localhost
+          POSTGRES_PORT: 5432
+          DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/customers"
+        run: |
+          pip install -r backend/product_service/requirements-dev.txt
+          pytest backend/product_service/tests/
+
+  build_and_push:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ secrets.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push customer service image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/customer-service:${{ github.sha }} backend/customer_service
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/customer-service:${{ github.sha }}
+
+      - name: Build and push order service image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/order-service:${{ github.sha }} backend/order_service
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/order-service:${{ github.sha }}
+
+      - name: Build and push product service image
+        run: |
+          docker build -t ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }} backend/product_service
+          docker push ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
+
+  deploy_staging:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/testing' && vars.DEPLOY_STAGING == 'true'
+    steps:
+      - name: Deploy customer service to staging
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: customer-service-staging
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_CUSTOMER_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/customer-service:${{ github.sha }}
+
+      - name: Deploy order service to staging
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: order-service-staging
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_ORDER_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/order-service:${{ github.sha }}
+
+      - name: Deploy product service to staging
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: product-service-staging
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_PRODUCT_STAGING }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
+
+  deploy_production:
+    needs: build_and_push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+      url: https://customer-service-production.azurewebsites.net
+    steps:
+      - name: Deploy customer service to production
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: customer-service-production
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_CUSTOMER_PRODUCTION }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/customer-service:${{ github.sha }}
+
+      - name: Deploy order service to production
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: order-service-production
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_ORDER_PRODUCTION }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/order-service:${{ github.sha }}
+
+      - name: Deploy product service to production
+        uses: azure/webapps-deploy@v2
+        with:
+          app-name: product-service-production
+          publish-profile: ${{ secrets.PUBLISH_PROFILE_PRODUCT_PRODUCTION }}
+          images: ${{ secrets.ACR_LOGIN_SERVER }}/product-service:${{ github.sha }}
