@@ -6,6 +6,9 @@ on:
       - testing
       - main
 
+env:
+  DEPLOY_STAGING: ${{ vars.DEPLOY_STAGING }}
+
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -101,7 +104,7 @@ jobs:
   deploy_staging:
     needs: build_and_push
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/testing'
+    if: github.ref == 'refs/heads/testing' && env.DEPLOY_STAGING == 'true'
     steps:
       - name: Deploy customer service to staging
         uses: azure/webapps-deploy@v2
